@@ -100,6 +100,14 @@ try {
     // ----------------------------
     const panel = window.moonPanel;
     const toMinutes = v => { if (!Number.isFinite(v)) return null; return Math.abs(v) <= 24 ? Math.round(v * 60) : Math.round(v); };
+    let sunriseMin = Number.isFinite(moon?.sunrise)
+    ? toMinutes(moon.sunrise)
+    : (Number.isFinite(panel?.lastSunrise) ? toMinutes(panel.lastSunrise) : null);
+
+    let sunsetMin = Number.isFinite(moon?.sunset)
+    ? toMinutes(moon.sunset)
+    : (Number.isFinite(panel?.lastSunset) ? toMinutes(panel.lastSunset) : null);
+
     const normalizeTimelineToMinutes = (raw) => {
       if (!raw) return null;
       if (Array.isArray(raw)) return raw.map(s => ({ ...s, start: toMinutes(s.start), end: s.end === 24 ? 1440 : toMinutes(s.end) }));
@@ -113,22 +121,88 @@ try {
       }
       return out;
     };
+    
+let effectiveTimeline = null;
 
-    const timelineRaw = (moon && moon.sunPhaseTimeline) || (panel && panel.sunPhaseTimeline) || null;
-    const effectiveTimeline = normalizeTimelineToMinutes(timelineRaw);
+if (window.moonPanel?.computeSunPhaseTimelineFromFine) {
+  const events = window.moonPanel.computeSunPhaseTimelineFromFine(
+    window.moonPanel.lastSunFineElevationLocal || []
+  ) || [];
 
-    // compute sunrise/sunset minutes (prefer explicit values, otherwise derive from timeline)
-    let sunriseMin = Number.isFinite(moon?.sunrise) ? toMinutes(moon.sunrise) : (Number.isFinite(panel?.lastSunrise) ? toMinutes(panel.lastSunrise) : null);
-    let sunsetMin  = Number.isFinite(moon?.sunset)  ? toMinutes(moon.sunset)  : (Number.isFinite(panel?.lastSunset)  ? toMinutes(panel.lastSunset)  : null);
-    if ((!Number.isFinite(sunriseMin) || !Number.isFinite(sunsetMin)) && effectiveTimeline) {
-      // try to derive from effectiveTimeline.day if present
-      const dayRanges = effectiveTimeline.day || [];
-      if (dayRanges.length) {
-        sunriseMin = sunriseMin ?? dayRanges[0][0] ?? dayRanges[0].start;
-        const last = dayRanges[dayRanges.length - 1];
-        sunsetMin = sunsetMin ?? ((last[1] === 1440) ? 1439 : (last[1] - 1));
-      }
+    effectiveTimeline = {
+    astronomical: [],
+    nautical: [],
+    civil: [],
+    golden: [],
+    night: []
+  };
+
+  // collect transition minutes (we will pair them into intervals)
+  const mins = { astronomical: [], nautical: [], civil: [] };
+
+  for (const ev of events) {
+    if (ev?.type === 'sunrise' && Number.isFinite(ev.minute)) sunriseMin = sunriseMin ?? ev.minute;
+    if (ev?.type === 'sunset'  && Number.isFinite(ev.minute)) sunsetMin  = sunsetMin  ?? ev.minute;
+
+    if (ev?.type === 'astronomical_transition' && Number.isFinite(ev.minute)) mins.astronomical.push(ev.minute);
+    if (ev?.type === 'nautical_transition'      && Number.isFinite(ev.minute)) mins.nautical.push(ev.minute);
+    if (ev?.type === 'civil_transition'         && Number.isFinite(ev.minute)) mins.civil.push(ev.minute);
+
+    if ((ev?.type === 'golden_morning' || ev?.type === 'golden_evening') && Number.isFinite(ev.start) && Number.isFinite(ev.end)) {
+      effectiveTimeline.golden.push([ev.start, ev.end]);
     }
+  }
+
+  const pairToIntervals = (arr) => {
+  const a = (arr || []).slice().filter(Number.isFinite).sort((x,y) => x - y);
+  const out = [];
+  for (let i = 0; i + 1 < a.length; i += 2) {
+    const s = a[i], e = a[i + 1];
+    if (e !== s) out.push([s, e]);
+  }
+  return out;
+};
+
+effectiveTimeline.astronomical = pairToIntervals(mins.astronomical);
+effectiveTimeline.nautical     = pairToIntervals(mins.nautical);
+effectiveTimeline.civil        = pairToIntervals(mins.civil);
+
+  // derive sunrise/sunset from civil twilight if still missing:
+  // morning civil interval end ~= sunrise, evening civil interval start ~= sunset
+  if (!Number.isFinite(sunriseMin) && effectiveTimeline.civil.length) {
+    const morning = effectiveTimeline.civil
+      .map(([s,e]) => ({ s, e, mid: (s + e) / 2 }))
+      .filter(x => x.mid < 720)
+      .sort((a,b) => a.s - b.s)[0];
+    if (morning && Number.isFinite(morning.e)) sunriseMin = morning.e;
+  }
+  if (!Number.isFinite(sunsetMin) && effectiveTimeline.civil.length) {
+    const evening = effectiveTimeline.civil
+      .map(([s,e]) => ({ s, e, mid: (s + e) / 2 }))
+      .filter(x => x.mid >= 720)
+      .sort((a,b) => b.s - a.s)[0];
+    if (evening && Number.isFinite(evening.s)) sunsetMin = evening.s;
+  }
+
+  // build night intervals for completeness (renderer already draws night band from sunrise/sunset)
+  if (Number.isFinite(sunriseMin) && Number.isFinite(sunsetMin)) {
+    const s = ((Math.round(sunriseMin) % 1440) + 1440) % 1440;
+    const e = ((Math.round(sunsetMin)  % 1440) + 1440) % 1440;
+    if (s <= e) {
+      if (s > 0) effectiveTimeline.night.push([0, s]);
+      if (e < 1440) effectiveTimeline.night.push([e, 1440]);
+    } else {
+      // polar-like wrap: night between sunset and sunrise
+      effectiveTimeline.night.push([e, s]);
+    }
+  } else if (
+    effectiveTimeline.civil.length === 0 &&
+    effectiveTimeline.nautical.length === 0 &&
+    effectiveTimeline.astronomical.length === 0
+  ) {
+    effectiveTimeline.night = [[0, 1440]];
+  }
+}
 
     // draw night band (wrap-aware)
     ctx.fillStyle = "#00264a";
@@ -606,10 +680,10 @@ try {
             const panel = window.moonPanel;
             if ((!livePos || livePos.elev === undefined || livePos.time === undefined) && panel && panel.minuteMap) {
                 // compute nowServer (ms) as before, but then derive a single canonical reference:
-// panel._lastTargetOffset is expected to be minutes to add to UTC to get local (e.g. +60 for CET).
-const nowServer = panel._lastServerDate
-  ? new Date(panel._lastServerDate.getTime() + (Date.now() - panel._lastServerTimestamp))
-  : new Date();
+                // panel._lastTargetOffset is expected to be minutes to add to UTC to get local (e.g. +60 for CET).
+         const nowServer = panel._lastServerDate
+         ? new Date(panel._lastServerDate.getTime() + (Date.now() - panel._lastServerTimestamp))
+         : new Date();
 
                 // canonical offset in minutes: prefer panel value if finite, otherwise browser TZ
                 const offsetMin = Number.isFinite(panel && panel._lastTargetOffset) ? Number(panel._lastTargetOffset) : -new Date().getTimezoneOffset();
@@ -935,4 +1009,3 @@ if (typeof window.drawToOffscreenAndBlit === 'function' && typeof window.drawMoo
     };
   })();
 }
-
