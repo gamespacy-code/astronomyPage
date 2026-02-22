@@ -12,6 +12,11 @@
 // Erwartete Hilfsfunktionen/Module:
 //   /livewetter/astronomie/mond/moonTime.js
 //   /livewetter/astronomie/mond/moonInterpolation.js
+// (füge die helper-Funktion an einer sinnvollen Stelle ein, z.B. nahe anderen Hilfsfunktionen oder am Datei‑Anfang)
+// helper: normalize minute index into 0..1439
+function wrapMinute(m) {
+  return Number.isFinite(m) ? (((m % 1440) + 1440) % 1440) : NaN;
+}
 
 import { getMoonDay, getMoonDurationForCalendarDay } from "/livewetter/astronomie/mond/moonTime.js";
 import {
@@ -69,6 +74,257 @@ import {
       }
     },
 
+  // Deterministic moon minuteMap builder and fine elevation generator
+// Loads yesterday/today/tomorrow out_YYYY-MM-DD.json from moonpos folder,
+// normalizes timestamps and resolves per-minute conflicts deterministically.
+async buildMoonMinuteMapAndFine(referenceLocalMidnightMs) {
+  try {
+    const z = n => String(n).padStart(2,'0');
+    const refMs = Number.isFinite(referenceLocalMidnightMs) ? referenceLocalMidnightMs : (this._referenceLocalMidnightMs || Date.now());
+    const d = new Date(refMs);
+    const yyyy = d.getFullYear(), mm = z(d.getMonth()+1), dd = z(d.getDate());
+    const y = new Date(refMs - 86400000), yy = y.getFullYear(), ym = z(y.getMonth()+1), yd = z(y.getDate());
+    const t = new Date(refMs + 86400000), ty = t.getFullYear(), tm = z(t.getMonth()+1), td = z(t.getDate());
+    const monthsDe = ['januar','februar','maerz','april','mai','juni','juli','august','september','oktober','november','dezember'];
+    const monthFolder = monthsDe[d.getMonth()] || mm;
+    const base = `/livewetter/astronomie/mond/moonpos/${yyyy}/${monthFolder}`;
+    const urls = [
+      `${base}/out_${yy}-${ym}-${yd}.json`,
+      `${base}/out_${yyyy}-${mm}-${dd}.json`,
+      `${base}/out_${ty}-${tm}-${td}.json`
+    ];
+
+    const fetchJson = async u => {
+      try { const r = await fetch(u, {cache:'no-store'}); if (!r.ok) return null; return await r.json(); } catch(e){ return null; }
+    };
+
+    const blocks = [];
+    for (const u of urls) {
+      const j = await fetchJson(u);
+      if (!j) continue;
+      if (Array.isArray(j.data)) blocks.push(j.data);
+      else {
+        const key = Object.keys(j).find(k => Array.isArray(j[k]));
+        if (key) blocks.push(j[key]);
+      }
+    }
+    if (!blocks.length) {
+      if (this._debug) console.warn('buildMoonMinuteMapAndFine: no moon blocks found', urls);
+      this.moonMinuteMap = new Map();
+      this.lastFineElevationLocal = new Array(1440).fill(NaN);
+      if (typeof this.onFineElevationUpdated === 'function') this.onFineElevationUpdated();
+      return;
+    }
+
+    // normalize records to { _utcMs, elevation, azimuth }
+    const normalized = [];
+    for (const blk of blocks) {
+      for (const rec of blk) {
+        const elev = rec.elevation ?? rec[1];
+        const az = rec.azimuth ?? rec[2];
+        let ms = null;
+        if (rec.raw_nearest && Number.isFinite(rec.raw_nearest._utcMs)) ms = rec.raw_nearest._utcMs;
+        else if (rec._utcMs && Number.isFinite(rec._utcMs)) ms = rec._utcMs;
+        else if (rec.ts_utc) ms = (new Date(rec.ts_utc)).getTime();
+        else if (rec.ts_local) ms = (new Date(rec.ts_local)).getTime();
+        else if (rec.time) {
+          const tstr = String(rec.time).replace(/^-/, '');
+          const [hh, mm] = tstr.split(':').map(Number);
+          const neg = String(rec.time).startsWith('-');
+          const dayOffset = neg ? -1 : 0;
+          ms = refMs + dayOffset*86400000 + hh*3600000 + mm*60000;
+        }
+        if (!Number.isFinite(ms)) continue;
+        normalized.push({ _utcMs: ms, elevation: Number.isFinite(elev) ? elev : NaN, azimuth: az });
+      }
+    }
+
+    // conflict resolution: choose per-minute record with minimal distance to minute center
+    const minuteCenterMs = i => refMs + i*60000 + 30000;
+    const tmp = new Map(); // minute -> { rec, dist }
+    for (const r of normalized) {
+      const minuteIndex = Math.round((r._utcMs - refMs) / 60000);
+      const norm = (((minuteIndex % 1440) + 1440) % 1440);
+      const center = minuteCenterMs(norm);
+      const dist = Math.abs(r._utcMs - center);
+      const existing = tmp.get(norm);
+      if (!existing || dist < existing.dist) tmp.set(norm, { rec: r, dist });
+    }
+
+    const moonMinuteMap = new Map();
+    for (const [min, obj] of tmp.entries()) {
+      moonMinuteMap.set(Number(min), { elev: obj.rec.elevation, az: obj.rec.azimuth, _utcMs: obj.rec._utcMs, raw: obj.rec });
+    }
+
+    this.moonMinuteMap = moonMinuteMap;
+    this._referenceLocalMidnightMs = refMs;
+    this._lastMoonNormalized = normalized.slice(0,200);
+
+    // compute fine elevation using interpolation helper if available
+    const interp = window._moonInterpolation?.interpolateMinuteMapAt;
+    if (typeof interp === 'function') {
+      const arr = new Array(1440).fill(NaN);
+      for (let i=0;i<1440;i++){
+        const r = interp(this.moonMinuteMap, i);
+        arr[i] = (r && Number.isFinite(r.elev)) ? r.elev : NaN;
+      }
+      this.lastFineElevationLocal = arr;
+      if (typeof this.onFineElevationUpdated === 'function') this.onFineElevationUpdated();
+    } else {
+      this.lastFineElevationLocal = new Array(1440).fill(NaN);
+      if (typeof this.onFineElevationUpdated === 'function') this.onFineElevationUpdated();
+    }
+  } catch (e) {
+    if (this._debug) console.warn('buildMoonMinuteMapAndFine failed', e);
+    this.moonMinuteMap = new Map();
+    this.lastFineElevationLocal = new Array(1440).fill(NaN);
+    if (typeof this.onFineElevationUpdated === 'function') this.onFineElevationUpdated();
+  }
+},
+
+// ----------------------------
+// Sun data helpers (minutes-based canonicalization)
+// ----------------------------
+buildMinuteMapFromSunJson(rawData, referenceLocalMidnightMs) {
+  try {
+    if (!Array.isArray(rawData) || rawData.length === 0) return { minuteMap: new Map(), referenceLocalMidnightMs: referenceLocalMidnightMs || null };
+    const firstLocal = rawData[0].ts_local ? new Date(rawData[0].ts_local) : null;
+    const refMs = Number.isFinite(referenceLocalMidnightMs) ? referenceLocalMidnightMs
+      : (firstLocal ? new Date(firstLocal.getFullYear(), firstLocal.getMonth(), firstLocal.getDate(), 0, 0, 0).getTime() : null);
+    const minuteMap = new Map();
+    for (const rec of rawData) {
+      try {
+        const utcMs = rec._utcMs || (rec.ts_utc ? new Date(rec.ts_utc).getTime() : (rec._raw && rec._raw._utcMs) || null);
+        if (!Number.isFinite(utcMs)) continue;
+        const minuteIndex = Math.round((utcMs - refMs) / 60000);
+        const norm = (((minuteIndex % 1440) + 1440) % 1440);
+        minuteMap.set(norm, { elev: Number.isFinite(rec.elevation) ? rec.elevation : NaN, az: rec.azimuth, _utcMs: utcMs, raw: rec });
+      } catch (e) { /* ignore per-record errors */ }
+    }
+    return { minuteMap, referenceLocalMidnightMs: refMs };
+  } catch (e) {
+    if (this._debug) console.warn('buildMinuteMapFromSunJson failed', e);
+    return { minuteMap: new Map(), referenceLocalMidnightMs: referenceLocalMidnightMs || null };
+  }
+},
+
+computeFineElevationFromMinuteMap(minuteMap, interpFn) {
+  try {
+    const arr = new Array(1440).fill(NaN);
+    for (let i = 0; i < 1440; i++) {
+      const p = minuteMap.get(i);
+      if (p && Number.isFinite(p.elev)) { arr[i] = p.elev; continue; }
+      if (typeof interpFn === 'function') {
+        const r = interpFn(minuteMap, i);
+        if (r && Number.isFinite(r.elev)) arr[i] = r.elev;
+      }
+    }
+    return arr;
+  } catch (e) {
+    if (this._debug) console.warn('computeFineElevationFromMinuteMap failed', e);
+    return new Array(1440).fill(NaN);
+  }
+},
+
+// --- Replace existing computeSunPhaseTimelineFromFine with this implementation ---
+// Uses only localized minute values from the raw sun JSON (minuteLocal or ts_local).
+computeSunPhaseTimelineFromFine(sunFineElevation) {
+  try {
+    // Helper: get raw day rows (prefer internal raw, else global loaded JSON)
+    const rawRows = this._lastSunRaw || window.__lastSunNormalized || window.__sunData || [];
+    const refMs = Number.isFinite(this._referenceLocalMidnightMs) ? this._referenceLocalMidnightMs : (window.__sunMeta && window.__sunMeta.referenceLocalMidnightMs) || null;
+
+    // Build minute -> elevation map from raw rows (sparse)
+    const minuteElev = new Map();
+    for (const r of rawRows) {
+      let minute = Number(r.minuteLocal);
+      if (!Number.isFinite(minute) && typeof r.ts_local === 'string') {
+        const d = new Date(r.ts_local);
+        if (!Number.isNaN(d.getTime())) minute = d.getHours() * 60 + d.getMinutes();
+      }
+      if (!Number.isFinite(minute)) continue;
+      minute = ((minute % 1440) + 1440) % 1440;
+      const elev = Number(r.elev ?? r.elevation ?? r.raw_nearest?.elevation ?? NaN);
+      minuteElev.set(minute, Number.isFinite(elev) ? elev : NaN);
+    }
+
+    // If minuteElev is empty, fall back to sunFineElevation (if available) by scanning indices
+    if (!minuteElev.size && Array.isArray(sunFineElevation) && sunFineElevation.length === 1440) {
+      for (let i = 0; i < 1440; i++) {
+        const v = sunFineElevation[i];
+        if (Number.isFinite(v)) minuteElev.set(i, v);
+      }
+    }
+
+    // Utility: find minute (from minuteElev keys) whose elevation is nearest to threshold
+    const nearestMinuteTo = (threshold) => {
+      let bestMin = null, bestDiff = Infinity;
+      for (const [m, e] of minuteElev.entries()) {
+        if (!Number.isFinite(e)) continue;
+        const diff = Math.abs(e - threshold);
+        if (diff < bestDiff) { bestDiff = diff; bestMin = m; }
+      }
+      return bestMin;
+    };
+
+    // Build simple timeline using raw minutes (no interpolation)
+    // Dawn/dusk thresholds
+    const astroMin = nearestMinuteTo(-18);
+    const nautMin  = nearestMinuteTo(-12);
+    const civilMin = nearestMinuteTo(-6);
+
+    // Sunrise / Sunset: pick nearest-to-0 candidates and choose ordering (sunrise earlier than sunset)
+    const zeroCandidates = Array.from(minuteElev.entries())
+      .filter(([m,e]) => Number.isFinite(e))
+      .map(([m,e]) => ({ m, e, d: Math.abs(e) }))
+      .sort((a,b) => a.d - b.d || a.m - b.m);
+
+    let sunrise = null, sunset = null;
+    if (zeroCandidates.length) {
+      sunrise = zeroCandidates[0].m;
+      // prefer a candidate after sunrise for sunset
+      const alt = zeroCandidates.find(c => c.m !== sunrise && c.m > sunrise);
+      if (alt) sunset = alt.m;
+      else {
+        const alt2 = zeroCandidates.find(c => c.m !== sunrise);
+        if (alt2) {
+          if (alt2.m > sunrise) sunset = alt2.m;
+          else { sunset = sunrise; sunrise = alt2.m; }
+        } else {
+          sunset = null;
+        }
+      }
+    }
+
+    // Golden hours: simple 60-minute rule (if sunrise/sunset exist)
+    const goldenMorning = (sunrise != null) ? { start: sunrise, end: Math.min(sunrise + 60, 1439) } : null;
+    const goldenEvening = (sunset != null) ? { start: Math.max(sunset - 60, 0), end: sunset } : null;
+
+    // Compose timeline entries (minute indices only)
+    const timeline = [];
+    if (astroMin != null) timeline.push({ type: 'astronomical_transition', minute: astroMin, threshold: -18 });
+    if (nautMin  != null) timeline.push({ type: 'nautical_transition', minute: nautMin, threshold: -12 });
+    if (civilMin != null) timeline.push({ type: 'civil_transition', minute: civilMin, threshold: -6 });
+    if (sunrise != null) timeline.push({ type: 'sunrise', minute: sunrise });
+    if (sunset  != null) timeline.push({ type: 'sunset', minute: sunset });
+    if (goldenMorning) timeline.push(Object.assign({ type: 'golden_morning' }, goldenMorning));
+    if (goldenEvening) timeline.push(Object.assign({ type: 'golden_evening' }, goldenEvening));
+
+    // Attach local ms if referenceLocalMidnightMs is available
+    if (Number.isFinite(refMs)) {
+      for (const ev of timeline) {
+        if (ev.minute != null) ev.localMs = Math.round(refMs + ev.minute * 60000);
+        if (ev.start != null) ev.startLocalMs = Math.round(refMs + ev.start * 60000);
+        if (ev.end != null) ev.endLocalMs = Math.round(refMs + ev.end * 60000);
+      }
+    }
+
+    return timeline;
+  } catch (e) {
+    if (this._debug) console.warn('computeSunPhaseTimelineFromFine (simple) failed', e);
+    return [];
+  }
+},
     // ---------------------------------------------------------
     // Helper: authoritative "now" based on server reference
     // Uses performance.now() if available to be robust against system clock changes
@@ -154,9 +410,16 @@ import {
       const serverUtc = simDate || await this._fetchServerDate();
       if (serverUtc) {
         try {
+
           const zurichDec = zurichDecimalFromUTC(serverUtc);
-          const utcDec = serverUtc.getUTCHours() + serverUtc.getUTCMinutes() / 60 + serverUtc.getUTCSeconds() / 3600;
+          // serverUtc may be provided as a server timestamp; treat it as local for offset computation
+          // Compute local decimal hour from the Date object to avoid mixing UTC fields with local data.
+          const utcDec = (function(d){
+            if (!d) return NaN;
+            return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+          })(serverUtc);
           let offsetHours = zurichDec - utcDec;
+
           if (offsetHours > 12) offsetHours -= 24;
           if (offsetHours < -12) offsetHours += 24;
           return Math.round(offsetHours * 60);
@@ -244,9 +507,9 @@ import {
 
         const localCalendarDate = new Date(nowUtc.getTime() + (targetOffset * 60000));
         const localDate = localCalendarDate;
-        const yyyy = localCalendarDate.getUTCFullYear();
-        const mm = localCalendarDate.getUTCMonth() + 1;
-        const dd = localCalendarDate.getUTCDate();
+        const yyyy = localCalendarDate.getFullYear();
+        const mm = localCalendarDate.getMonth() +1;
+        const dd = localCalendarDate.getDate();
 
         const yyyyStr = String(yyyy);
         const mmStr = String(mm).padStart(2, "0");
@@ -254,9 +517,9 @@ import {
 
         // yesterday local (target timezone)
         const yesterdayLocal = new Date(localDate.getTime() - 86400000);
-        const yY = yesterdayLocal.getUTCFullYear();
-        const yM = yesterdayLocal.getUTCMonth() + 1;
-        const yD = yesterdayLocal.getUTCDate();
+        const yY = yesterdayLocal.getFullYear();
+        const yM = yesterdayLocal.getMonth() +1;
+        const yD = yesterdayLocal.getDate();
 
         const yYStr = String(yY);
         const yMStr = String(yM).padStart(2, "0");
@@ -374,13 +637,22 @@ import {
             source: 'today'
           }));
 
-        // reference LOCAL midnight ms (UTC epoch for local 00:00 of the chosen local date)
-        const referenceLocalMidnightMs = Date.UTC(
-          localCalendarDate.getUTCFullYear(),
-          localCalendarDate.getUTCMonth(),
-          localCalendarDate.getUTCDate(),
-          0, 0, 0
-        ) - (targetOffset * 60000);
+        // compute UTC ms that corresponds to local midnight for the chosen localCalendarDate
+        // take targetOffset into account so day boundary follows local midnight
+        const serverNowForRef = this._getNowServer ? this._getNowServer() : new Date();
+        const offsetMinForRef = Number.isFinite(this._lastTargetOffset) ? this._lastTargetOffset : -new Date().getTimezoneOffset();
+        
+        // derive a local date consistent with server + offset, then compute local midnight ms
+        // prefer an existing reference if present, otherwise compute local midnight ms from the local date fields
+        const localDateForRef = new Date(serverNowForRef.getTime() + offsetMinForRef * 60000);
+        const referenceLocalMidnightMs = Number.isFinite(this._referenceLocalMidnightMs)
+          ? this._referenceLocalMidnightMs
+          : (new Date(
+              localCalendarDate.getFullYear(),
+              localCalendarDate.getMonth(),
+              localCalendarDate.getDate(),
+              0, 0, 0
+            )).getTime();
 
         // persistente Referenz für alle Interpolationen (local midnight ms)
         this._referenceLocalMidnightMs = referenceLocalMidnightMs;
@@ -753,172 +1025,40 @@ import {
           return ka - kb;
         });
         const sunMinuteMap = buildMinuteMapFromRaw(rawSun48);
+    
+// --- replaced: compute sunFineElevation and phase timeline using new helpers ---
+const offsetMinForSun = Number.isFinite(this._lastTargetOffset) ? Number(this._lastTargetOffset) : -new Date().getTimezoneOffset();
 
-        // Build sunFineElevation (local minute domain) and compute sunrise/sunset precisely
-        const sunFineElevation = new Array(1440);
-        const offsetMinForSun = Number.isFinite(this._lastTargetOffset) ? Number(this._lastTargetOffset) : -new Date().getTimezoneOffset();
-        for (let i = 0; i < 1440; i++) {
-          const localMinute = i;
-          const utcMinute = (Math.round(localMinute - offsetMinForSun) + 1440) % 1440;
-          const interp = interpolateMinuteMapAt(sunMinuteMap, utcMinute);
-          sunFineElevation[i] = interp ? interp.elev : NaN;
-        }
-        // Defensive: fill NaN gaps in sunFineElevation by linear interpolation so phase detection sees night
-        (function fillNaNs(arr){
-          const finiteIdx = [];
-          for (let i=0;i<arr.length;i++) if (Number.isFinite(arr[i])) finiteIdx.push(i);
-          if (!finiteIdx.length) return;
-          const first = finiteIdx[0], last = finiteIdx[finiteIdx.length-1];
-          for (let i=0;i<first;i++) arr[i] = arr[first];
-          for (let i=last+1;i<arr.length;i++) arr[i] = arr[last];
-          for (let g=0; g<finiteIdx.length-1; g++) {
-            const i0 = finiteIdx[g], i1 = finiteIdx[g+1];
-            const v0 = arr[i0], v1 = arr[i1];
-            const span = i1 - i0;
-            if (span <= 1) continue;
-            for (let k=1;k<span;k++) {
-              const f = k / span;
-              arr[i0 + k] = v0 + (v1 - v0) * f;
-            }
-          }
-        })(sunFineElevation);
+// Build a canonical sunMinuteMap from the finalRaw (if you have finalRaw array available)
+// If you already have sunMinuteMap variable (as in file), keep it. Otherwise build from finalRaw:
+// const sunMinuteMap = window._moonInterpolation?.buildMinuteMapFromRaw ? window._moonInterpolation.buildMinuteMapFromRaw(finalRaw, this._referenceLocalMidnightMs) : sunMinuteMap;
 
-        // Compute sunrise and sunset as fractional hours from sunFineElevation
-        let sunrise = null;
-        let sunset = null;
-        for (let i = 1; i < 1440; i++) {
-          const prev = sunFineElevation[i - 1];
-          const now = sunFineElevation[i];
-          if (prev < 0 && now >= 0 && sunrise === null) {
-            const f = (0 - prev) / (now - prev);
-            sunrise = (i - 1 + f) / 60;
-          }
-          if (prev >= 0 && now < 0 && sunset === null) {
-            const f = (prev - 0) / (prev - now);
-            sunset = (i - 1 + f) / 60;
-          }
-          if (sunrise !== null && sunset !== null) break;
-        }
+this.sunMinuteMap = sunMinuteMap; // keep reference for debugging
 
-        // ---------------------------------------------------------
-        // Compute twilight phases and golden/blue hour
-        // ---------------------------------------------------------
-        function detectPhase(elevDeg) {
-          if (elevDeg >= 6) return "day";
-          if (elevDeg >= -4 && elevDeg < 6) return "golden";
-          if (elevDeg >= -6 && elevDeg < -4) return "blue";
-          if (elevDeg >= -6 && elevDeg < 0) return "civil";
-          if (elevDeg >= -12 && elevDeg < -6) return "nautical";
-          if (elevDeg >= -18 && elevDeg < -12) return "astronomical";
-          return "night";
-        }
+// Compute sunFineElevation (local minute domain) using interpolation helper if available
+const interpFn = (typeof window._moonInterpolation?.interpolateMinuteMapAt === 'function') ? window._moonInterpolation.interpolateMinuteMapAt : null;
+const sunFineElevation = this.computeFineElevationFromMinuteMap(this.sunMinuteMap, interpFn);
 
-        // Scan 1440 minutes and detect transitions
-        let lastPhase = null;
-        let phaseChanges = [];
+// store for renderer
+this.lastSunFineElevationLocal = sunFineElevation;
 
-        for (let i = 0; i < 1440; i++) {
-          const elev = sunFineElevation[i];
-          if (!Number.isFinite(elev)) continue;
+// compute phase timeline and sunrise/sunset in minutes
+const timelineResult = this.computeSunPhaseTimelineFromFine(sunFineElevation);
 
-          const phase = detectPhase(elev);
-          if (phase !== lastPhase) {
-            phaseChanges.push({ minute: i, phase });
-            lastPhase = phase;
-          }
-        }
+// store structured timeline (minutes)
+this.sunPhaseTimeline = {
+  day: timelineResult.day,
+  civil: timelineResult.civil,
+  nautical: timelineResult.nautical,
+  astronomical: timelineResult.astronomical,
+  golden: timelineResult.golden
+};
 
-        // Convert minute → decimal hour
-        function minuteToHour(m) { return m / 60; }
-
-        // Build a structured phase timeline
-        let phaseTimeline = [];
-        for (let i = 0; i < phaseChanges.length; i++) {
-          const cur = phaseChanges[i];
-          const next = phaseChanges[i + 1];
-          phaseTimeline.push({
-            phase: cur.phase,
-            start: minuteToHour(cur.minute),
-            end: next ? minuteToHour(next.minute) : 24
-          });
-        }
-
-        // Fallback: if phaseTimeline empty (e.g. missing sunMinuteMap), set coarse phase flags from sunrise/sunset
-        if ((!phaseTimeline || phaseTimeline.length === 0) && (typeof sunrise === 'number' || typeof sunset === 'number')) {
-          try {
-            const nowServerForPhase = this._getNowServer();
-            const utcMinutesNowFloat = nowServerForPhase.getUTCHours() * 60 + nowServerForPhase.getUTCMinutes() + (nowServerForPhase.getUTCSeconds() / 60) + (nowServerForPhase.getUTCMilliseconds() / 60000);
-            const localMinuteFloat = (utcMinutesNowFloat + (Number.isFinite(this._lastTargetOffset) ? this._lastTargetOffset : -new Date().getTimezoneOffset()) + 1440) % 1440;
-            const nowMin = Math.floor(localMinuteFloat);
-            const toMin = h => Math.round((h % 24) * 60);
-            const srMin = (typeof sunrise === 'number') ? toMin(sunrise) : null;
-            const ssMin = (typeof sunset === 'number') ? toMin(sunset) : null;
-            let curPhase = 'unknown';
-            if (srMin !== null && ssMin !== null) {
-              const within = (a,b,x) => { const diff = ((x - a + 1440) % 1440); const span = ((b - a + 1440) % 1440); return diff >= 0 && diff < span; };
-              curPhase = within(srMin, ssMin, nowMin) ? 'day' : 'night';
-            }
-            const isGolden = (srMin !== null && Math.abs(((nowMin - srMin + 1440) % 1440)) <= 60) || (ssMin !== null && Math.abs(((nowMin - ssMin + 1440) % 1440)) <= 60);
-            const isBlue = (srMin !== null && Math.abs(((nowMin - srMin + 1440) % 1440)) > 30 && Math.abs(((nowMin - srMin + 1440) % 1440)) <= 60) ||
-                           (ssMin !== null && Math.abs(((nowMin - ssMin + 1440) % 1440)) > 30 && Math.abs(((nowMin - ssMin + 1440) % 1440)) <= 60);
-            this.currentSunPhase = curPhase;
-            this.isNight = curPhase === 'night';
-            this.isGoldenHour = !!isGolden;
-            this.isBlueHour = !!isBlue;
-            this.isCivilTwilight = false;
-            this.isNauticalTwilight = false;
-            this.isAstronomicalTwilight = false;
-            if (this._debug) console.info('moonPanel: applied fallback sun phase flags', { currentSunPhase: this.currentSunPhase, isGoldenHour: this.isGoldenHour });
-          } catch (e) { if (this._debug) console.warn('fallback phase compute failed', e); }
-        }
-        // Store results
-        this.sunPhaseTimeline = phaseTimeline;
-        this.currentSunPhase = this.currentSunPhase || (phaseTimeline.length ? phaseTimeline.find(p => {
-          const nowServerForPhase = this._getNowServer();
-          const utcMinutesNowFloat = nowServerForPhase.getUTCHours() * 60 + nowServerForPhase.getUTCMinutes() + (nowServerForPhase.getUTCSeconds() / 60) + (nowServerForPhase.getUTCMilliseconds() / 60000);
-          const localMinuteFloat = (utcMinutesNowFloat + (Number.isFinite(this._lastTargetOffset) ? this._lastTargetOffset : -new Date().getTimezoneOffset()) + 1440) % 1440;
-          const nowMin = Math.floor(localMinuteFloat);
-          const s = Math.round(p.start * 60), e = Math.round(p.end * 60);
-          return nowMin >= s && nowMin < e;
-        })?.phase : this.currentSunPhase);
-
-        this.isNight = this.isNight || (this.currentSunPhase === 'night');
-        this.isGoldenHour = this.isGoldenHour || (this.currentSunPhase === 'golden');
-        this.isBlueHour = this.isBlueHour || (this.currentSunPhase === 'blue');
-        this.isCivilTwilight = this.isCivilTwilight || (this.currentSunPhase === 'civil');
-        this.isNauticalTwilight = this.isNauticalTwilight || (this.currentSunPhase === 'nautical');
-        this.isAstronomicalTwilight = this.isAstronomicalTwilight || (this.currentSunPhase === 'astronomical');
-
-        // SPEICHERN (konsistente Property-Namen)
-        this.lastDayData = this.lastDayData || raw48h;
-        // compute fineElevation/azimuth from minuteMap if not already computed
-        if (!this.lastFineElevationLocal || !Array.isArray(this.lastFineElevationLocal) || this.lastFineElevationLocal.length !== 1440) {
-          const fineElevation = new Array(1440).fill(NaN);
-          const fineAzimuth = new Array(1440).fill(NaN);
-          for (let i = 0; i < 1440; i++) {
-            const v = interpolateMinuteMapAt(this.minuteMap, i);
-            fineElevation[i] = v && Number.isFinite(v.elev) ? v.elev : NaN;
-            fineAzimuth[i] = v && Number.isFinite(v.az) ? v.az : NaN;
-          }
-          this.lastFineElevationLocal = fineElevation;
-          this.lastFineAzimuthLocal = fineAzimuth;
-        }
-        this.lastSunFineElevationLocal = sunFineElevation;
-        // compute kulmination if not set
-        if (!this.lastKulmination || !Number.isFinite(this.lastKulmination.elev) || this.lastKulmination.elev === -999) {
-          let maxElev = -Infinity, maxMinute = 0;
-          for (let i = 0; i < 1440; i++) {
-            const v = this.lastFineElevationLocal[i];
-            if (Number.isFinite(v) && v > maxElev) { maxElev = v; maxMinute = i; }
-          }
-          this.lastKulmination = { time: maxMinute / 60, elev: Number.isFinite(maxElev) ? maxElev : -999 };
-        }
-        this.lastRiseBefore = this.lastRiseBefore || null;
-        this.lastSetAfter = this.lastSetAfter || null;
-        this.lastSunrise = sunrise;
-        this.lastSunset = sunset;
-        this.lastSunriseRaw = sunrise;
-        this.lastSunsetRaw = sunset;
+// store sunrise/sunset as minutes (0..1439) and keep raw hours if you want
+this.lastSunrise = Number.isFinite(timelineResult.sunriseMin) ? timelineResult.sunriseMin : null;
+this.lastSunset  = Number.isFinite(timelineResult.sunsetMin)  ? timelineResult.sunsetMin  : null;
+this.lastSunriseRaw = (this.lastSunrise !== null) ? (this.lastSunrise / 60) : null;
+this.lastSunsetRaw  = (this.lastSunset  !== null) ? (this.lastSunset  / 60) : null;
 
        // debug log will be emitted after urls are known (moved below)
 
@@ -932,9 +1072,13 @@ import {
             if (!Array.isArray(raw) || raw.length === 0) { self.secondMap = null; return; }
 
             const ref = Number.isFinite(self._referenceLocalMidnightMs)
-              ? self._referenceLocalMidnightMs
-              : Date.UTC(lastServerDate.getUTCFullYear(), lastServerDate.getUTCMonth(), lastServerDate.getUTCDate(), 0, 0, 0);
-         
+  ? self._referenceLocalMidnightMs
+  : (function(){
+      // compute local midnight ms for lastServerDate (canonical)
+      const last = lastServerDate || new Date();
+      return (new Date(last.getFullYear(), last.getMonth(), last.getDate(), 0, 0, 0)).getTime();
+    })();
+
             // Normalize points: ensure numeric sec, elev, az, ms
             const pts = raw.map(r => {
               const ms = Number.isFinite(r._utcMs) ? Number(r._utcMs) : (ref + (function(){
@@ -1041,36 +1185,120 @@ import {
     }
 
     if (typeof window.drawMoonGraph === 'function') {
+      // buildMoonPayload: always compute fresh kulmination and sun arrays at call time
+      const buildMoonPayload = (overrides = {}) => {
+        // normalize kulmination from current panel state
+        let kul = this.lastKulmination && Object.keys(this.lastKulmination).length ? this.lastKulmination : null;
+        if (!kul) {
+          kul = { minute: null, time: null, timeStr: null, elev: null };
+        } else {
+          if (kul.minute != null && !Number.isFinite(kul.time)) kul.time = kul.minute / 60;
+          if (!kul.timeStr && Number.isFinite(kul.minute)) kul.timeStr = `${String(Math.floor(kul.minute/60)).padStart(2,'0')}:${String(kul.minute%60).padStart(2,'0')}`;
+        }
 
-      const buildMoonPayload = (overrides = {}) => ({
-        fineElevation: this.lastFineElevationLocal,
-        sunFineElevation: this.lastSunFineElevationLocal,
-        sunFine: this.lastSunFineElevationLocal,
-        kulmination: this.lastKulmination,
-        riseBefore: this.lastRiseBefore,
-        setAfter: this.lastSetAfter,
-        sunrise: Number.isFinite(this.lastSunrise) ? this.lastSunrise : null,
-        sunset: Number.isFinite(this.lastSunset) ? this.lastSunset : null,
-        sunPhaseTimeline: this.sunPhaseTimeline || null,
-        currentSunPhase: this.currentSunPhase || null,
-        showLivePoint: true,
-        livePos: this.getLivePos ? this.getLivePos() : window.moonLivePos,
-        serverTimeLocal: this.serverNowLocalStr,
-        ...overrides
-      });
+        const sunFine = (Array.isArray(this.lastSunFineElevationLocal) && this.lastSunFineElevationLocal.length === 1440)
+          ? this.lastSunFineElevationLocal
+          : (Array.isArray(this.lastSunFine) && this.lastSunFine.length === 1440) ? this.lastSunFine : new Array(1440).fill(NaN);
 
-      // initial draw
-      try { window.drawMoonGraph(document.getElementById('moonGraph'), buildMoonPayload()); } catch (e) { /* ignore */ }
+        return {
+          fineElevation: this.lastFineElevationLocal,
+         sunFineElevation: sunFine,
+          sunFine: sunFine,
+          kulmination: kul,
+          riseBefore: this.lastRiseBefore,
+          setAfter: this.lastSetAfter,
+          sunrise: Number.isFinite(this.lastSunrise) ? this.lastSunrise : null,
+          sunset: Number.isFinite(this.lastSunset) ? this.lastSunset : null,
+          sunPhaseTimeline: this.sunPhaseTimeline || null,
+          currentSunPhase: this.currentSunPhase || null,
+          showLivePoint: true,
+          livePos: this.getLivePos ? this.getLivePos() : window.moonLivePos,
+          serverTimeLocal: this.serverNowLocalStr,
+          ...overrides
+        };
+      }; // Ende buildMoonPayload
 
-      // start/replace periodic redraw (1s)
-      if (window._moonGraphInterval) clearInterval(window._moonGraphInterval);
-      window._moonGraphInterval = setInterval(() => {
+      // expose buildMoonPayload on the panel instance
+      this.buildMoonPayload = buildMoonPayload;
+
+      // computeKulmination: find minute of max elevation and set this.lastKulmination
+      this.computeKulmination = function() {
+        const arr = Array.isArray(this.lastFineElevationLocal) ? this.lastFineElevationLocal : (this.lastFineElevation || []);
+        if (!arr || !arr.length) {
+          this.lastKulmination = { minute: null, time: null, timeStr: null, elev: null };
+          return this.lastKulmination;
+        }
+        let maxElev = -Infinity, maxMin = null;
+        arr.forEach((v,i)=>{ if (Number.isFinite(v) && v>maxElev){ maxElev=v; maxMin=i; }});
+        if (maxMin === null) {
+          this.lastKulmination = { minute: null, time: null, timeStr: null, elev: null };
+        } else {
+          this.lastKulmination = {
+            minute: maxMin,
+            time: +(maxMin/60).toFixed(6),
+            timeStr: `${String(Math.floor(maxMin/60)).padStart(2,'0')}:${String(maxMin%60).padStart(2,'0')}`,
+            elev: maxElev
+          };
+        }
+        return this.lastKulmination;
+      };
+
+      // compute initial kulmination if fine array already present
+      try { this.computeKulmination(); } catch(e) {}
+
+      // Hook: call computeKulmination whenever lastFineElevationLocal is updated.
+      // Call this.onFineElevationUpdated() after you set this.lastFineElevationLocal.
+      this.onFineElevationUpdated = () => {
+        this.computeKulmination();
+        // optional: trigger redraw
         try {
-          window.drawMoonGraph(document.getElementById('moonGraph'), buildMoonPayload());
-        } catch (e) { /* ignore */ }
-      }, 1000);
+          if (typeof this.render === 'function') this.render();
+          else if (window.drawMoonGraph && document.getElementById('moonGraph')) {
+            try { window.drawMoonGraph(document.getElementById('moonGraph'), this.buildMoonPayload()); } catch(e){ /* ignore */ }
+          }
+        } catch(e){}
+      };
+
+      // guarded initial draw: ensure moon + sun fine arrays exist before first draw
+      try {
+        const canvas = document.getElementById('moonGraph');
+        const panel = this;
+        const ensureFineArraysAndDraw = async () => {
+          const maxAttempts = 6; // retry up to ~6 seconds
+          let attempt = 0;
+          const hasMoonFine = () => Array.isArray(panel.lastFineElevationLocal) && panel.lastFineElevationLocal.length === 1440;
+          const hasSunFine  = () => Array.isArray(panel.lastSunFineElevationLocal) && panel.lastSunFineElevationLocal.length === 1440;
+
+          while (attempt < maxAttempts) {
+            if (!hasMoonFine()) {
+              try { if (typeof panel.buildMoonMinuteMapAndFine === 'function') await panel.buildMoonMinuteMapAndFine(panel._referenceLocalMidnightMs); } catch (e) { if (panel._debug) console.warn('buildMoonMinuteMapAndFine failed', e); }
+            }
+            if (!hasSunFine()) {
+              try { if (typeof panel.buildSunMinuteMapAndFine === 'function') await panel.buildSunMinuteMapAndFine(panel._referenceLocalMidnightMs); } catch (e) { if (panel._debug) console.warn('buildSunMinuteMapAndFine failed', e); }
+            }
+            if (hasMoonFine() && hasSunFine()) {
+              try { window.drawMoonGraph?.(canvas, buildMoonPayload()); } catch (e) { /* ignore */ }
+              return true;
+            }
+            await new Promise(res => setTimeout(res, 1000));
+            attempt++;
+          }
+
+          // final fallback draw (defensive)
+          try { window.drawMoonGraph?.(canvas, buildMoonPayload()); } catch (e) { /* ignore */ }
+          return false;
+        };
+
+        // run but do not block init completion
+        ensureFineArraysAndDraw().then(ok => { if (this._debug) console.info('initial draw readiness', ok ? 'ok' : 'fallback-draw'); });
+
+        // start/replace periodic redraw (1s)
+        if (window._moonGraphInterval) clearInterval(window._moonGraphInterval);
+        window._moonGraphInterval = setInterval(() => {
+          try { window.drawMoonGraph(document.getElementById('moonGraph'), buildMoonPayload()); } catch (e) { /* ignore */ }
+        }, 1000);
+      } catch (e) { /* ignore */ }
     }
-     
         } catch (e) { /* ignore */ }
 
         return true;
@@ -1097,13 +1325,13 @@ import {
         const nowServer = this._getNowServer ? this._getNowServer() : new Date();
         const targetOffset = Number.isFinite(this._lastTargetOffset) ? this._lastTargetOffset : (-new Date().getTimezoneOffset());
         const local = new Date(nowServer.getTime() + targetOffset * 60000);
-        const yyyy = String(local.getUTCFullYear());
-        const mm = String(local.getUTCMonth() + 1).padStart(2,'0');
-        const dd = String(local.getUTCDate()).padStart(2,'0');
+        const yyyy = String(local.getFullYear());
+        const mm = String(local.getMonth() + 1).padStart(2,'0');
+        const dd = String(local.getDate()).padStart(2,'0');
         const y = new Date(local.getTime() - 86400000);
-        const yY = String(y.getUTCFullYear());
-        const yM = String(y.getUTCMonth() + 1).padStart(2,'0');
-        const yD = String(y.getUTCDate()).padStart(2,'0');
+        const yY = String(y.getFullYear());
+        const yM = String(y.getMonth() + 1).padStart(2,'0');
+        const yD = String(y.getDate()).padStart(2,'0');
 
         // Pfad anpassen falls nötig
         const base = '/livewetter/astronomie/mond/moonpos/2026/februar/';
@@ -1137,14 +1365,116 @@ import {
           }
         }
 
+        // ensure we start with a fresh minuteMap for this rebuild
+        if (this.minuteMap && typeof this.minuteMap.clear === 'function') {
+          this.minuteMap.clear();
+        } else {
+          this.minuteMap = new Map();
+        }
         const raw48 = [];
+
+        // Compute canonical reference local midnight in panel's target local time.
+        // Use panel._lastServerDate (server absolute time) and apply panel target offset (minutes)
+        // to derive the correct local calendar date, then compute local midnight ms.
+        const lastServerDate = this._lastServerDate || new Date(this.serverNowUtcMs || Date.now());
+        const offsetMin = Number.isFinite(this._lastTargetOffset) ? this._lastTargetOffset : -new Date().getTimezoneOffset();
+        // convert server absolute ms to the panel's local ms by adding offset minutes
+        const localMsForDate = lastServerDate.getTime() + (offsetMin * 60000);
+        const localDate = new Date(localMsForDate);
+        const canonicalReferenceLocalMidnightMs = Number.isFinite(this._referenceLocalMidnightMs)
+          ? this._referenceLocalMidnightMs
+          : (new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0)).getTime();
+        // persist canonical reference so all code paths use the same base (local ms)
+        this._referenceLocalMidnightMs = canonicalReferenceLocalMidnightMs;
+
         const parseItem = it => {
+
           if (!it) return null;
           const elev = Number.isFinite(it.elevation) ? it.elevation : (Number.isFinite(it.elev) ? it.elev : undefined);
           const az = Number.isFinite(it.azimuth) ? it.azimuth : (Number.isFinite(it.az) ? it.az : undefined);
           if (it.time && elev != null && az != null) return { time: String(it.time).split('.')[0], elevation: elev, azimuth: az, _utcMs: Number.isFinite(it._utcMs)?it._utcMs:undefined };
-          if (it.ts_utc && elev != null && az != null) { const ms = (new Date(it.ts_utc)).getTime(); const d = new Date(ms); return { time: `${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}:${String(d.getUTCSeconds()).padStart(2,'0')}`, elevation: elev, azimuth: az, _utcMs: ms }; }
-          if (it._utcMs && elev != null && az != null) { const d = new Date(it._utcMs); return { time: `${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}:${String(d.getUTCSeconds()).padStart(2,'0')}`, elevation: elev, azimuth: az, _utcMs: it._utcMs }; }
+          
+          // Normalize incoming item timestamps to local ms and compute minuteKey relative to local midnight.
+          if ((it.ts_utc || it.ts_local || it._utcMs) && elev != null && az != null) {
+            try {
+              // prefer explicit local timestamp if present
+              let localMs = null;
+              if (it.ts_local) {
+                // ts_local includes timezone offset, new Date(...) yields absolute ms
+                localMs = new Date(it.ts_local).getTime();
+              } else if (it._utcMs) {
+                // _utcMs is absolute UTC ms; convert to local ms by creating Date from it (same absolute ms)
+                localMs = Number(it._utcMs);
+              } else if (it.ts_utc) {
+                // ts_utc is an ISO UTC string; new Date(...) yields absolute ms
+                localMs = new Date(it.ts_utc).getTime();
+              }
+
+              // Determine referenceLocalMidnightMs for this item.
+              // Prefer the canonical panel reference if it matches the item's calendar date,
+              // otherwise compute a per-item local-midnight based on ts_local or localMs.
+              let referenceLocalMidnightMs = canonicalReferenceLocalMidnightMs;
+
+              // If we have an explicit ts_local (ISO with offset), derive the calendar date from it.
+              if (!Number.isFinite(referenceLocalMidnightMs) || (it && it.ts_local)) {
+                if (it && it.ts_local) {
+                  // ts_local is like "YYYY-MM-DDTHH:MM:SS+01:00" — extract date part to get the intended local calendar day
+                  try {
+                    const datePart = String(it.ts_local).split('T')[0];
+                    const [iy, im, id] = datePart.split('-').map(Number);
+                    if (Number.isFinite(iy) && Number.isFinite(im) && Number.isFinite(id)) {
+                      referenceLocalMidnightMs = (new Date(iy, im - 1, id, 0, 0, 0)).getTime();
+                    }
+                  } catch (e) { /* fallthrough */ }
+                }
+              }
+
+              // If still not set (or ts_local not present), derive from localMs using panel target offset
+              if (!Number.isFinite(referenceLocalMidnightMs) && Number.isFinite(localMs)) {
+                const offsetMin = Number.isFinite(this._lastTargetOffset) ? this._lastTargetOffset : -new Date().getTimezoneOffset();
+                const localDate = new Date(localMs + offsetMin * 60000);
+                referenceLocalMidnightMs = (new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0)).getTime();
+              }
+
+              // Fallback: if still not set, use canonicalReferenceLocalMidnightMs (if available)
+              if (!Number.isFinite(referenceLocalMidnightMs)) referenceLocalMidnightMs = canonicalReferenceLocalMidnightMs;
+
+              if (Number.isFinite(localMs) && Number.isFinite(referenceLocalMidnightMs)) {
+                const minuteKeyRaw = Math.round((localMs - referenceLocalMidnightMs) / 60000);
+                const minuteKey = wrapMinute(minuteKeyRaw);
+                it.minuteKey = minuteKeyRaw;
+                it._minuteIndex = minuteKey;
+
+                if (window.__MM_DBG) {
+                  if (!window.__MM_DBG_COUNT) window.__MM_DBG_COUNT = 0;
+                  if (window.__MM_DBG_COUNT < 40) {
+                    try {
+                      console.log('MM-DBG', {
+                        idx: window.__MM_DBG_COUNT,
+                        minuteKeyRaw: typeof minuteKeyRaw !== 'undefined' ? minuteKeyRaw : null,
+                        minuteKey: typeof minuteKey !== 'undefined' ? minuteKey : (it && it._minuteIndex),
+                        localMs: typeof localMs !== 'undefined' ? new Date(localMs).toISOString() : null,
+                        ts_local: it && it.ts_local,
+                        _utcMs: it && it._utcMs,
+                        refLocalMidIso: typeof referenceLocalMidnightMs !== 'undefined' ? new Date(referenceLocalMidnightMs).toISOString() : (this && this._referenceLocalMidnightMs ? new Date(this._referenceLocalMidnightMs).toISOString() : null)
+                      });
+                    } catch(e){}
+                    window.__MM_DBG_COUNT++;
+                  }
+                }
+                // NOTE: Do not write into panel.minuteMap here.
+                // The minuteMap will be built once from the fully normalized finalRaw array below.
+                // Keep minuteKeyRaw/_minuteIndex on the item for later normalization.
+                // by buildMinuteMapFromRaw / interpolation helper below.
+                // optional debug: remove after verification
+                // console.debug('MM-DBG insert', { minuteKeyRaw, minuteKey, ts_local: it.ts_local, _utcMs: it._utcMs, refIso: new Date(referenceLocalMidnightMs).toISOString() });
+              }
+
+            } catch (e) {
+              // non-fatal: leave item as-is
+            }
+          }
+
           return null;
         };
 
@@ -1153,9 +1483,8 @@ import {
           if (this._debug) console.warn('moonPanel: _rebuildFromPerDay found no raw entries');
           return false;
         }
-
-        const lastServerDate = this._lastServerDate || new Date(this.serverNowUtcMs || Date.now());
-        const referenceLocalMidnightMs = Date.UTC(lastServerDate.getUTCFullYear(), lastServerDate.getUTCMonth(), lastServerDate.getUTCDate(), 0,0,0) - (targetOffset * 60000);
+        // persist the canonical reference so parseItem and other code paths use the same value
+        this._referenceLocalMidnightMs = referenceLocalMidnightMs;
 
         // normalize and compute minuteKey
         const normalized = raw48.map(r => {
@@ -1182,34 +1511,14 @@ import {
         const appended = head.map(r => ({ time: r.time, elevation: r.elevation, azimuth: r.azimuth, _utcMs: Number.isFinite(r._utcMs) ? r._utcMs + 86400000 : undefined, minuteKey: Number.isFinite(r.minuteKey) ? r.minuteKey + 1440 : undefined }));
         const finalRaw = normalized.concat(appended);
 
-        // build minuteMap (use helper if available)
-        if (typeof window._moonInterpolation?.buildMinuteMapFromRaw === 'function') {
-          this.minuteMap = window._moonInterpolation.buildMinuteMapFromRaw(finalRaw, referenceLocalMidnightMs);
-          this.lastDayData = finalRaw.filter(r => Number.isFinite(r.minuteKey) && r.minuteKey >= -1440 && r.minuteKey <= 1439).sort((a,b)=>a.minuteKey-b.minuteKey);
-        
-// === Debug: Zusammenfassung der rebuild-Ergebnisse (nur wenn _debug true) ===
-if (this._debug) {
-  try {
-    const arr = this.lastDayData || [];
-    const sorted = arr.slice().sort((a,b)=> (Number(a._utcMs||0) - Number(b._utcMs||0)));
-    console.info('moonPanel: rebuild summary', {
-      lastDayDataLen: arr.length,
-      earliestUtc: sorted[0] ? sorted[0]._utcMs : null,
-      earliestLocal: sorted[0] ? new Date(sorted[0]._utcMs).toLocaleString('de-CH', { timeZone: 'Europe/Zurich' }) : null,
-      latestUtc: sorted[sorted.length-1] ? sorted[sorted.length-1]._utcMs : null,
-      latestLocal: sorted[sorted.length-1] ? new Date(sorted[sorted.length-1]._utcMs).toLocaleString('de-CH', { timeZone: 'Europe/Zurich' }) : null
-    });
-  } catch (e) {
-    console.warn('moonPanel: rebuild summary logging failed', e);
-  }
-}
-// === Ende Debug-Block ===
+        // replace moon minuteMap build with deterministic builder
+await this.buildMoonMinuteMapAndFine(this._referenceLocalMidnightMs);
 
-          if (this._debug) console.info('moonPanel: rebuild succeeded', { minuteMapSize: this.minuteMap?.size, lastDayDataLen: this.lastDayData?.length });
-        } else {
-          if (this._debug) console.error('moonPanel: buildMinuteMapFromRaw helper fehlt');
-          return false;
-        }
+// lastDayData: keep existing finalRaw-derived array for debugging/legacy uses
+this.lastDayData = (typeof finalRaw !== 'undefined' && Array.isArray(finalRaw)) ? finalRaw.filter(r => Number.isFinite(r.minuteKey) && r.minuteKey >= -1440 && r.minuteKey <= 1439).sort((a,b)=>a.minuteKey-b.minuteKey) : (this.lastDayData || []);
+
+// log
+if (this._debug) console.info('moonPanel: buildMoonMinuteMapAndFine completed', { moonMinuteMapSize: this.moonMinuteMap?.size, lastDayDataLen: this.lastDayData?.length });
 
         // recompute derived arrays (call helper if present)
         if (typeof this.recomputeDerivedFromMinuteMap === 'function') {
@@ -1218,12 +1527,43 @@ if (this._debug) {
           // inline recompute fallback
           const interp = (typeof window._moonInterpolation?.interpolateMinuteMapAt === 'function') ? window._moonInterpolation.interpolateMinuteMapAt : (m,i)=>m.get(Math.round(i))||{elev:NaN,az:NaN};
           const fineElevation = new Array(1440), fineAzimuth = new Array(1440);
-          for (let i=0;i<1440;i++){ const v = interp(this.minuteMap,i); fineElevation[i] = v && Number.isFinite(v.elev) ? v.elev : NaN; fineAzimuth[i] = v && Number.isFinite(v.az) ? v.az : NaN; }
+          for (let i=0;i<1440;i++){ const v = interp(this.moonMinuteMap,i); fineElevation[i] = v && Number.isFinite(v.elev) ? v.elev : NaN; fineAzimuth[i] = v && Number.isFinite(v.az) ? v.az : NaN; }
           let maxElev = -Infinity, maxMinute = 0;
           for (let i=0;i<1440;i++){ const v = fineElevation[i]; if (Number.isFinite(v) && v > maxElev) { maxElev = v; maxMinute = i; } }
           this.lastFineElevationLocal = fineElevation;
+          if (typeof this.onFineElevationUpdated === 'function') this.onFineElevationUpdated();
           this.lastFineAzimuthLocal = fineAzimuth;
-          this.lastKulmination = { time: maxMinute/60, elev: Number.isFinite(maxElev) ? maxElev : -999 };
+          // compute kulmination (max elevation) and store minutes + formatted time
+try {
+  if (Array.isArray(this.lastFineElevationLocal) && this.lastFineElevationLocal.length === 1440) {
+    let maxElev = -Infinity, maxMinute = null;
+    for (let i = 0; i < 1440; i++) {
+      const v = this.lastFineElevationLocal[i];
+      if (Number.isFinite(v) && v > maxElev) { maxElev = v; maxMinute = i; }
+    }
+
+    if (maxMinute !== null && Number.isFinite(maxElev)) {
+      const timeHours = maxMinute / 60;
+      const hh = Math.floor(maxMinute / 60);
+      const mm = maxMinute % 60;
+      const timeStr = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
+      this.lastKulmination = {
+        minute: maxMinute,            // integer minute 0..1439
+        time: timeHours,              // hours as float (e.g. 6.4833)
+        timeStr: timeStr,             // human friendly "HH:MM"
+        elev: maxElev                 // elevation in degrees
+      };
+    } else {
+      this.lastKulmination = { minute: null, time: null, timeStr: null, elev: null };
+    }
+  } else {
+    this.lastKulmination = { minute: null, time: null, timeStr: null, elev: null };
+  }
+  if (this._debug) console.info('moonPanel: lastKulmination computed', this.lastKulmination);
+} catch (e) {
+  if (this._debug) console.warn('compute kulmination failed', e);
+  this.lastKulmination = { minute: null, time: null, timeStr: null, elev: null };
+}
         }
 
         // redraw/update
@@ -1281,9 +1621,10 @@ if (this._debug) {
     const serverLocalStr = this._formatServerLocal(nowServer);
     const offsetMin = Number.isFinite(this._lastTargetOffset) ? this._lastTargetOffset : -new Date().getTimezoneOffset();
 
-    // compute local minute float (fractional minutes)
-    const utcMinutesNowFloat = nowServer.getUTCHours() * 60 + nowServer.getUTCMinutes() + (nowServer.getUTCSeconds() / 60) + (nowServer.getUTCMilliseconds() / 60000);
-    const localMinuteFloat = (utcMinutesNowFloat + offsetMin + 1440) % 1440;
+   // compute local minute float directly from nowServer (which is an absolute Date)
+   const localMinutesNowFloat = nowServer.getHours() * 60 + nowServer.getMinutes() + (nowServer.getSeconds() / 60) + (nowServer.getMilliseconds() / 60000);
+   // if you still need to apply target offset (rare if nowServer already reflects server+offset), do so explicitly
+   const localMinuteFloat = (localMinutesNowFloat + 1440) % 1440;
 
     let liveElev = NaN, liveAz = NaN, source = 'none';
 
@@ -1314,22 +1655,47 @@ if (this._debug) {
       } catch (e) { /* ignore */ }
 
       if ((!Number.isFinite(liveElev) || !Number.isFinite(liveAz)) && this.secondMap && this._lastServerDate) {
-        const ref = Number.isFinite(this._referenceLocalMidnightMs) ? this._referenceLocalMidnightMs : Date.UTC(this._lastServerDate.getUTCFullYear(), this._lastServerDate.getUTCMonth(), this._lastServerDate.getUTCDate(), 0, 0, 0);
-        const secRel = Math.round((nowServer.getTime() - ref) / 1000);
-        const radius = Number.isFinite(this._secondMapSearchRadius) ? this._secondMapSearchRadius : 10;
-        let best = null;
-        for (let d = 0; d <= radius; d++) {
-          const candidates = d === 0 ? [secRel] : [secRel - d, secRel + d];
-          for (const s of candidates) {
-            const p = this.secondMap.get(s);
-            if (p && Number.isFinite(p.elev)) {
-              if (!best || Math.abs(s - secRel) < Math.abs(best.sec - secRel)) {
-                best = { elev: p.elev, az: p.az, sec: s, ms: p.ms };
-              }
-            }
-          }
-          if (best) break;
+      
+        const ref = Number.isFinite(this._referenceLocalMidnightMs)
+          ? this._referenceLocalMidnightMs
+          : (function(){
+              const offsetMin = Number.isFinite(this._lastTargetOffset) ? this._lastTargetOffset : -new Date().getTimezoneOffset();
+              const localDate = new Date(this._lastServerDate.getTime() + offsetMin * 60000);
+              return Date.UTC(localDate.getUTCFullYear(), localDate.getUTCMonth(), localDate.getUTCDate(), 0, 0, 0) - offsetMin * 60000;
+            }).call(this);
+            
+// compute secRel (seconds since reference) and try wrapped lookups with ±86400 fallbacks
+const secRel = Math.round((nowServer.getTime() - ref) / 1000);
+const secWrapped = ((secRel % 86400) + 86400) % 86400;
+const radius = Number.isFinite(this._secondMapSearchRadius) ? this._secondMapSearchRadius : 10;
+let best = null;
+
+for (let d = 0; d <= radius; d++) {
+  // candidate seconds to try for this radius step
+  const baseCandidates = (d === 0) ? [secWrapped] : [secWrapped - d, secWrapped + d];
+  for (const baseSec of baseCandidates) {
+    // try same-day key, then next-day and previous-day equivalents
+    const candidates = [baseSec, baseSec + 86400, baseSec - 86400];
+    for (const c of candidates) {
+      const p = this.secondMap.get(c);
+      if (p && Number.isFinite(p.elev)) {
+        // compute distance to original secRel (unwrapped) to pick nearest
+        const dist = Math.abs(c - secRel);
+        if (!best || dist < Math.abs(best.sec - secRel)) {
+          best = { elev: p.elev, az: p.az, sec: c, ms: p.ms };
         }
+      }
+    }
+  }
+  if (best) break;
+}
+
+if (best) {
+  liveElev = best.elev;
+  liveAz = best.az;
+  source = 'secondMap';
+}
+
         if (best) {
           liveElev = best.elev;
           liveAz = best.az;
@@ -1343,16 +1709,20 @@ if (this._debug) {
       liveAz = ((liveAz % 360) + 360) % 360;
     }
 
-    // set global live pos (time in local hours)
-    window.moonLivePos = {
-      time: localMinuteFloat / 60,
-      elev: Number.isFinite(liveElev) ? liveElev : NaN,
-      az: Number.isFinite(liveAz) ? liveAz : NaN,
-      serverUtcMs: nowServer.getTime(),
-      serverLocal: serverLocalStr,
-      serverOffsetMin: offsetMin,
-      _liveSource: source
-    };
+    // set global live pos (time in local hours) — normalize time to [0,24)
+    (function(){
+      const rawTime = Number.isFinite(localMinuteFloat) ? (localMinuteFloat / 60) : NaN;
+      const normTime = Number.isFinite(rawTime) ? (((rawTime % 24) + 24) % 24) : NaN;
+      window.moonLivePos = {
+        time: Number.isFinite(normTime) ? normTime : rawTime,
+        elev: Number.isFinite(liveElev) ? liveElev : NaN,
+        az: Number.isFinite(liveAz) ? liveAz : NaN,
+        serverUtcMs: nowServer.getTime(),
+        serverLocal: serverLocalStr,
+        serverOffsetMin: offsetMin,
+        _liveSource: source
+      };
+    })();
 
     // update UI
     if (typeof this.updatePanel === 'function') {
